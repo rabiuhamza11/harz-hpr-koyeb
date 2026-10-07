@@ -1,0 +1,191 @@
+// HPR-1 — HARZ PORTABLE RUNTIME CORE (P11 Phase 1 — extracted 2026-09-12)
+// Extracted from the P9/P10 survivor wrapper into substrate-agnostic glue.
+// UNSEALED and DISCLOSED by design. This core computes NOTHING cryptographic:
+// every digest, verdict, seal and write decision is executed by the CAPSULE's
+// sealed engine bytes (new Function). The core routes requests, composes the
+// disclosed overlay, and serves. It executes ANY capsule shaped:
+//   { manifest, ui_manifest, ui, code_manifest, code, state }
+// Runtime contract: the capsule's sealed engine must export CONTRACT, activeMarker,
+// canWrite, appendWithSeal, ingestReturn, verifyExport, digestOf, verifyChain,
+// hashAssets, sha256hex.
+// Substrate adapter: kv = { get(key) -> value|null, set(key, value) }, or null
+// (read-only capsule; writes refused honestly).
+
+const MIME = { "/": "text/html; charset=utf-8", "/app.css": "text/css; charset=utf-8", "/app.js": "application/javascript; charset=utf-8", "/icon.svg": "image/svg+xml", "/manifest.json": "application/json", "/sw.js": "application/javascript; charset=utf-8" };
+
+async function sha256hex(s) {
+  const d = await crypto.subtle.digest("SHA-256", new TextEncoder().encode(s));
+  return [...new Uint8Array(d)].map((b) => b.toString(16).padStart(2, "0")).join("");
+}
+
+export function createRuntime(capsule, kv, opts = {}) {
+  const C = capsule;
+  const WALKED_FROM = opts.walkedFrom ?? JSON.stringify(C.manifest && C.manifest.origin ? C.manifest.origin : {});
+  const RUNTIME = { name: "HARZ Portable Runtime", version: "hpr-1.0.0", extracted: "2026-09-12", phase: "P11 Phase 1 — runtime extraction" };
+
+  const BOUNDARY = {
+    doc: "HARZ Portable Runtime — Security & Portability Boundary", version: "hpr-1.0.0", date: "2026-09-12",
+    guarantees: [
+      "The capsule (state + UI + sealed engine) is served verbatim; the verdict is DERIVED by executing the sealed engine string (new Function), never typed.",
+      "Writes are executed BY the sealed engine and are legal only while an active walkout marker is sealed in the chain — refused otherwise by sealed code.",
+      "Every write appends a record + a SHA-256 seal to the overlay; the digest rolls forward. Append-only.",
+      "RUNTIME EXTRACTION (P11 Phase 1): the wrapper glue was extracted into this core. Behavior parity is proven when the book served through the core computes the byte-identical digest.",
+    ],
+    cannot_detect: [
+      "Hash seals are tamper-EVIDENCE, not signatures — no authorship is proven.",
+      "Sealed write code proves UNCHANGED, not CORRECT — a sealed bug is still a bug.",
+      "The overlay persistence (KV/D1/SQLite) is UNSEALED glue (disclosed); the seals and digests are computed by the sealed engine, but the store itself is trusted.",
+      "SINGLE-WRITER per capsule: one writer, one overlay. Not multi-writer consensus, not failover, not a distributed database. Concurrent writes are not proven at this scale.",
+      "MARKER PROVENANCE: the walkout marker is trusted from the kill route — not unforgeable.",
+      "Lockstep rewrite of the entire package still self-verifies (unsolved hash-chain limit); external anchors are the mitigation.",
+    ],
+    trust: ["The substrate must faithfully execute the sealed bytes. Verify the digest yourself: fetch /api/export and run the sealed engine at /api/source."],
+    research: "P11 / HPR-1 experiment of the cloud-substrate research program. Prototype at test scale. Not a product.",
+    rung2_merge: { date: "2026-10-01", text: "RUNG 2 MERGE (HarzNet law, owner \"Do all and leave 3 later\"): engine v1.0.0 adds deterministic state reconciliation — mergeBooks in the sealed bytes. Deterministic (lexicographic tip rule), fork detection at merge time, principle-4 verdicts, merge receipts with the second side preserved verbatim as evidence, replay-safe and exactly-once. Fail-closed: CONTRADICTED / UNRESOLVED never merge. The /api/merge rail COMPUTES; adoption is explicit (R8 gated on owner topology word)." },
+  };
+
+  function loadSealedEngine() {
+    return (new Function(C.code["/engine.js"] + "; return { CONTRACT, activeMarker, canWrite, appendWithSeal, ingestReturn, verifyExport, digestOf, verifyChain, hashAssets, sha256hex, receiveBundle: (typeof receiveBundle !== 'undefined') ? receiveBundle : null, mergeBooks: (typeof mergeBooks !== 'undefined') ? mergeBooks : null };"))();
+  }
+
+  async function overlay() {
+    // REBUILD RULE (disclosed unsealed glue): overlay entries already ingested into the frozen
+    // chain by the sealed return gate are historical residue of the death window — IGNORED in the
+    // active state, REPORTED here, NEVER deleted.
+    if (!kv) return { records: [], seals: [], lastDigest: null, stale: 0 };
+    const raw = (await kv.get("overlay")) || { records: [], seals: [], lastDigest: null };
+    const frozenSealHashes = new Set(C.state.chain.map((s) => s.hash));
+    const frozenRecordIds = new Set(C.state.records.map((x) => String(x.id)));
+    const seals = raw.seals.filter((s) => !frozenSealHashes.has(s.hash));
+    const records = raw.records.filter((x) => !frozenRecordIds.has(String(x.id)));
+    const stale = (raw.seals.length - seals.length) + (raw.records.length - records.length);
+    const lastDigest = seals.length === 0 ? null : raw.lastDigest;
+    return { records, seals, lastDigest, stale };
+  }
+
+  function composedState(ov) {
+    return { records: C.state.records.concat(ov.records), chain: C.state.chain.concat(ov.seals) };
+  }
+
+  async function this_verify(expected) {
+    // internal re-verify after adoption — recompute the composed digest via the sealed engine
+    const ov2 = await overlay();
+    const state2 = composedState(ov2);
+    const d2 = await E2().digestOf(state2, C.ui_manifest, C.code_manifest);
+    const v2 = await E2().verifyExport({ state: state2, ui_manifest: C.ui_manifest, ui: C.ui, code_manifest: C.code_manifest, code: C.code, digest: d2 });
+    return { status: 200, headers: {}, body: JSON.stringify({ records: state2.records.length, chain_length: state2.chain.length, verdict: v2.verdict, digest: d2, ok: v2.ok && d2 === expected }) };
+  }
+  function E2() { return loadSealedEngine(); }
+  async function handle(method, path, body) {
+    const CORS = { "access-control-allow-origin": "*", "cache-control": "no-store" };
+    const json = (o, s = 200) => ({ status: s, headers: { ...CORS, "content-type": "application/json" }, body: JSON.stringify(o) });
+    if (method === "OPTIONS") return { status: 204, headers: CORS, body: null };
+    try {
+      const ov = await overlay();
+      const E = loadSealedEngine();
+      const state = composedState(ov);
+      const composedDigest = await E.digestOf(state, C.ui_manifest, C.code_manifest);
+      if (C.ui[path] !== undefined) {
+        const h = await sha256hex(C.ui[path]);
+        if (h !== C.ui_manifest[path]) return { status: 500, headers: CORS, body: "TAMPER GUARD: served UI asset does not match its sealed hash" };
+        return { status: 200, headers: { ...CORS, "content-type": MIME[path] }, body: C.ui[path] };
+      }
+      if (path === "/api/health") return json({ ok: true, service: "HARZ Portable Runtime", runtime: RUNTIME, capsule_version: (C.manifest && C.manifest.version) || "?", contract: E.CONTRACT, engine: "sealed-executed (new Function)", frozen_records: C.state.records.length, overlay: kv ? (ov.records.length + " overlay record(s) — store attached") : "STORE NOT ATTACHED — writes will be refused (503)", overlay_records: ov.records.length, stale_overlay_ingested: ov.stale, writes: (await E.canWrite(state)).ok ? "WALKOUT ACTIVE — sealed writes open" : "sealed-refused (no active walkout marker)" });
+      if (path === "/boundary") return json(BOUNDARY);
+      if (path === "/api/records") return json({ ok: true, records: state.records, walked_from: WALKED_FROM, overlay: kv ? (ov.records.length + " overlay record(s) — store attached") : "STORE NOT ATTACHED — writes will be refused (503)", overlay_records: ov.records.length, stale_overlay_ingested: ov.stale, writes: (await E.canWrite(state)).ok ? "WALKOUT ACTIVE — sealed writes open" : (await E.canWrite(state)).reason });
+      if (path === "/api/source") {
+        const src = C.code["/engine.js"];
+        const h = await sha256hex(src);
+        if (h !== C.code_manifest["/engine.js"]) return { status: 500, headers: CORS, body: "TAMPER GUARD: served engine does not match its sealed hash" };
+        return { status: 200, headers: { ...CORS, "content-type": "application/javascript; charset=utf-8" }, body: src };
+      }
+      if (path === "/api/record" && method === "POST") {
+        let b; try { b = JSON.parse(body || ""); } catch (_e) { return json({ ok: false, error: "bad json" }, 400); }
+        const recBody = String((b && b.body) ? b.body : "").trim().slice(0, 300);
+        if (!recBody) return json({ ok: false, error: "body required" }, 400);
+        const cw = await E.canWrite(state);
+        if (!cw.ok) return json({ ok: false, verdict: cw.reason, writes: "sealed-refused" }, 403);
+        if (!kv) return json({ ok: false, verdict: "OVERLAY UNAVAILABLE — walkout marker is active but no overlay store is attached; attach a store, then rebuild.", writes: "overlay-unavailable" }, 503);
+        const r = await E.appendWithSeal(state, C.ui_manifest, C.code_manifest, recBody, new Date().toISOString(), "stranger");
+        if (!r.ok) return json({ ok: false, verdict: r.reason }, 403);
+        const v = await E.verifyExport({ state: r.state, ui_manifest: C.ui_manifest, ui: C.ui, code_manifest: C.code_manifest, code: C.code, digest: r.digest });
+        if (!v.ok) return json({ ok: false, verdict: "REFUSED — write did not verify as a capsule: " + v.verdict }, 409);
+        const newOv = { records: ov.records.concat([r.record]), seals: ov.seals.concat([r.seal]), lastDigest: r.digest };
+        await kv.set("overlay", newOv);
+        return json({ ok: true, verdict: "SEALED WRITE — appended by the sealed engine", id: r.record.id, digest: r.digest, seals: r.state.chain.length });
+      }
+      if (path === "/api/mesh/receive" && method === "POST") {
+        // MESH CONVERGENCE TEST v1 (hpr-1.1.0). This route is UNSEALED GLUE: it parses the
+        // request and persists what the SEALED engine gate decides. Every verdict —
+        // REFUSED / FORK DETECTED / CONVERGED / ADOPTED — comes from receiveBundle, the
+        // sealed engine surface pinned in the chain (pre-registered: anchors/mesh-v1/).
+        let b; try { b = JSON.parse(body || ""); } catch (_e) { return json({ ok: false, verdict: "REFUSED — bad json" }, 400); }
+        if (!E.receiveBundle) return json({ ok: false, verdict: "REFUSED — this node runs a pre-gate engine (hpr-1.0.0, pin " + C.code_manifest["/engine.js"].slice(0, 8) + "); re-pin to hpr-1.1.0 to receive books over the mesh", zero_ingest: true }, 403);
+        const r = await E.receiveBundle({ bundle: b, localState: state, localUiManifest: C.ui_manifest, localCodeManifest: C.code_manifest });
+        if (r.ok && r.action === "adopt") {
+          if (!kv) return json({ ok: false, verdict: "REFUSED — adoption needs an overlay store; none attached", zero_ingest: true }, 503);
+          const frozenRec = C.state.records.length, frozenSeal = C.state.chain.length;
+          const newOv = { records: r.state.records.slice(frozenRec), seals: r.state.chain.slice(frozenSeal), lastDigest: r.digest };
+          await kv.set("overlay", newOv);
+          const after = JSON.parse((await this_verify(r.digest)).body);
+          return json({ ok: true, verdict: r.verdict, action: "adopt", digest: r.digest, ingested: r.ingested, composed: { records: after.records, seals: after.chain_length, verdict: after.verdict } });
+        }
+        return json({ ok: r.ok, verdict: r.verdict, digest: r.digest || null, action: r.action || "none", ingested: r.ingested || null, zero_ingest: r.zero_ingest !== false }, r.ok ? 200 : (String(r.verdict).startsWith("FORK") ? 409 : 403));
+      }
+      if (path === "/api/export") {
+        return json({
+          ok: true,
+          manifest: { name: (C.manifest && C.manifest.name) || "HARZ Capsule", version: (C.manifest && C.manifest.version) || "?", contract: E.CONTRACT, program: (C.manifest && C.manifest.program) || "?", origin: Object.assign({}, C.manifest && C.manifest.origin ? C.manifest.origin : {}, { runtime: RUNTIME }), exported: new Date().toISOString(), overlay: { records: ov.records.length, seals: ov.seals.length, stale_ingested: ov.stale } },
+          ui_manifest: C.ui_manifest,
+          ui: C.ui,
+          code_manifest: C.code_manifest,
+          code: C.code,
+          state,
+          digest: composedDigest,
+        });
+      }
+      if (path === "/api/merge" && method === "POST") {
+        if (!E.mergeBooks) return json({ ok: false, verdict: 'BROKEN — engine has no merge law (pre-v1.0.0 capsule)' }, 500);
+        let b = null; try { b = JSON.parse(body); } catch (_e) { return json({ ok: false, verdict: 'INSUFFICIENT_EVIDENCE — bad json' }, 400); }
+        const remote = b && (b.remoteExport || b.export);
+        if (!remote) return json({ ok: false, verdict: 'INSUFFICIENT_EVIDENCE — remoteExport required (the other book\u2019s full export)' }, 400);
+        const ov = await overlay();
+        const state = composedState(ov);
+        const localDigest = await E.digestOf(state, C.ui_manifest, C.code_manifest);
+        const localExport = { manifest: C.manifest, state, ui_manifest: C.ui_manifest, ui: C.ui, code_manifest: C.code_manifest, code: C.code, digest: localDigest };
+        const r = await E.mergeBooks({ exportA: localExport, exportB: remote, uiManifest: C.ui_manifest, codeManifest: C.code_manifest });
+        const out = { ok: r.ok, verdict: r.verdict, merge_id: r.merge_id || null, zero_merge: r.zero_merge === true, rail: 'compute-only — adoption is explicit (R8 field test gated on owner word)' };
+        if (r.replay) out.replay = true;
+        if (r.ok && !r.replay) out.merged_export = { manifest: { version: 'merged' }, state: r.state, ui_manifest: C.ui_manifest, ui: C.ui, code_manifest: C.code_manifest, code: C.code, digest: r.digest };
+        if (!r.ok && r.conflicts) out.conflicts = r.conflicts;
+        return json(out, r.ok ? 200 : 409);
+      }
+      if (path === "/api/verify") {
+        const v = await E.verifyExport({ state, ui_manifest: C.ui_manifest, ui: C.ui, code_manifest: C.code_manifest, code: C.code, digest: composedDigest });
+        const cw = await E.canWrite(state);
+        return json({
+          ok: v.ok,
+          verdict: v.ok ? "CAPSULE INTACT — verdict derived from the sealed engine" : v.verdict,
+          runtime: RUNTIME,
+          derived_by: "sealed engine executed from capsule bytes (new Function)",
+          records: state.records.length,
+          chain_length: state.chain.length,
+          overlay: { records: ov.records.length, seals: ov.seals.length, stale_ingested: ov.stale },
+          writes: cw.ok ? "WALKOUT ACTIVE — sealed writes open" : cw.reason,
+          digest: v.digest,
+          digest_match: v.digest === composedDigest && (ov.lastDigest === null || v.digest === ov.lastDigest),
+          ui_ok: [...state.chain].reverse().find((s) => s.kind === "ui_manifest") ? [...state.chain].reverse().find((s) => s.kind === "ui_manifest").payload === JSON.stringify(C.ui_manifest) : false,
+          code_ok: [...state.chain].reverse().find((s) => s.kind === "code_pin") ? [...state.chain].reverse().find((s) => s.kind === "code_pin").payload === JSON.stringify(C.code_manifest) : false,
+          engine_hash: C.code_manifest["/engine.js"],
+          issues: v.issues,
+          contract: E.CONTRACT,
+        });
+      }
+      return json({ ok: false, error: "not found" }, 404);
+    } catch (e) {
+      return json({ ok: false, error: String(e) }, 500);
+    }
+  }
+
+  return { handle, RUNTIME, BOUNDARY, loadSealedEngine };
+}
